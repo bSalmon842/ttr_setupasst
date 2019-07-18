@@ -5,6 +5,9 @@ Author: Brock Salmon
 Notice: (C) Copyright 2019 by Brock Salmon and Trans Tasman Racing. All Rights Reserved.
 */
 
+// After IBT
+// TODO(bSalmon): Change how telemetry is parsed based on car
+
 // Static Definitions
 #define internal_func static
 #define local_persist static
@@ -29,13 +32,17 @@ typedef double f64;
 
 #include <stdio.h>
 #include <vector>
-#include <fstream>
 #include <string>
 #include <sstream>
 #include <cmath>
 #include <iostream>
 #include <Windows.h>
 #include <stdexcept>
+#include <regex>
+#include <algorithm>
+
+#include "irsdk_defines.h"
+#include "irsdk_utils.cpp"
 
 #define FL 0
 #define FR 1
@@ -57,21 +64,32 @@ SET_TEXT_WHITE(h)
 std::cout << s; \
 SET_TEXT_WHITE(h)
 
-struct CSVInfo
+struct SetupInfo
 {
-    std::vector<std::vector<std::string>> data;
-    s32 lapCol;
-    s32 flShockCol;
-    s32 frShockCol;
-    s32 rlShockCol;
-    s32 rrShockCol;
-    s32 flTyreCol;
-    s32 frTyreCol;
-    s32 rlTyreCol;
-    s32 rrTyreCol;
+    s32 lsCom;
+    s32 hsCom;
+    s32 lsReb;
+    s32 hsReb;
 };
 
-struct ShockInfo
+struct DataSetInfo
+{
+    s32 lapIndex;
+    
+    s32 tyreIndices[4];
+    s32 shockIndices[4];
+};
+
+struct IBTInfo
+{
+    std::vector<s32> laps;
+    f32 tyrePressures[4];
+    std::vector<f32> shockVels[4];
+    
+    SetupInfo setupInfo[4];
+};
+
+struct OutputInfo
 {
     std::vector<f32> shockVelValues;
     f32 loCom;
@@ -84,89 +102,344 @@ struct ShockInfo
     f32 loDiff;
     f32 hiDiff;
     
-    f32 loAdjust;
-    f32 hiAdjust;
+    s32 loAdjust;
+    s32 hiAdjust;
     
-    f32 tyrePressure;
     f32 tyrePresDiff;
 };
 
-internal_func CSVInfo InitArray(std::ifstream &file)
+internal_func void RegexMatchSetup(SetupInfo *setupInfo, std::string line, HANDLE consoleHandle)
 {
-    CSVInfo result = {};
-    std::string line;
-    std::string value;
+    std::regex damperRegex("^   (.s)(Comp|Rbd)(Damping: )([0-9]|1[0-6])( clicks)");
+    std::regex lsComRegex("^   (LsCompDamping: )([0-9]|1[0-6])( clicks)");
+    std::regex hsComRegex("^   (HsCompDamping: )([0-9]|1[0-6])( clicks)");
+    std::regex lsRebRegex("^   (LsRbdDamping: )([0-9]|1[0-6])( clicks)");
+    std::regex hsRebRegex("^   (HsRbdDamping: )([0-9]|1[0-6])( clicks)");
     
-    printf("Preparing to Parse File...\n");
-    
-    std::string calcLine;
-    std::vector<std::vector<std::string>> percentCalc;
-    while (std::getline(file, calcLine))
+    if (std::regex_match(line, damperRegex))
     {
-        std::vector<std::string> row;
-        percentCalc.push_back(row);
+        std::stringstream stream;
+        std::string word;
+        stream << line;
+        while (!stream.eof())
+        {
+            stream >> word;
+            
+            if (std::regex_match(line, lsComRegex))
+            {
+                std::stringstream(word) >> setupInfo->lsCom;
+            }
+            else if (std::regex_match(line, hsComRegex))
+            {
+                std::stringstream(word) >> setupInfo->hsCom;
+            }
+            else if (std::regex_match(line, lsRebRegex))
+            {
+                std::stringstream(word) >> setupInfo->lsReb;
+            }
+            else if (std::regex_match(line, hsRebRegex))
+            {
+                std::stringstream(word) >> setupInfo->hsReb;
+            }
+        }
+        
+        COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, line);
+    }
+}
+
+internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
+{
+    DataSetInfo dataSetInfo = {};
+    IBTInfo ibtInfo = {};
+    
+    irsdk_header header;
+    irsdk_diskSubHeader diskSubHeader;
+    irsdk_varHeader *varHeaders = 0;
+    
+    fread(&header, 1, sizeof(header), file);
+    fread(&diskSubHeader, 1, sizeof(diskSubHeader), file);
+    
+    if (ttrDebug)
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "--- Session Info ---");
     }
     
-    file.clear();
-    file.seekg(0, std::ios_base::beg);
-    
-    f32 oneValuePercent = 100.0f / percentCalc.size();
-    
-    printf("Parsing File...\n");
-    while (std::getline(file, line))
+    char *sessionInfoString = new char[header.sessionInfoLen];
+    std::vector<std::string> sessionData;
+    if (sessionInfoString)
     {
-        std::vector<std::string> row;
-        std::stringstream ss(line);
+        fseek(file, header.sessionInfoOffset, SEEK_SET);
+        fread(sessionInfoString, sizeof(char), header.sessionInfoLen, file);
+        sessionInfoString[header.sessionInfoLen - 1] = '\0';
         
-        while (std::getline(ss, value, ','))
+        // Session String Processing Here
+        // NOTE(bSalmon): This is where setup is held
+        
+        b32 flSection = false;
+        b32 frSection = false;
+        b32 rlSection = false;
+        b32 rrSection = false;
+        
+        std::string tempString = "";
+        for (s32 i = 0; i < header.sessionInfoLen; ++i)
         {
-            if (value == "Lap")
+            char currChar = sessionInfoString[i];
+            tempString += currChar;
+            
+            if (tempString == "  LeftFront:" && std::find(sessionData.begin(), sessionData.end(), "  LeftFront:\n") != sessionData.end())
             {
-                result.lapCol = (s32)row.size();
-            } 
-            else if (value == "LFshockVel")
-            {
-                result.flShockCol = (s32)row.size();
+                COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
+                flSection = true;
+                frSection = false;
+                rlSection = false;
+                rrSection = false;
             }
-            else if (value == "RFshockVel")
+            else if (tempString == "  RightFront:" && std::find(sessionData.begin(), sessionData.end(), "  RightFront:\n") != sessionData.end())
             {
-                result.frShockCol = (s32)row.size();
+                COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
+                flSection = false;
+                frSection = true;
+                rlSection = false;
+                rrSection = false;
             }
-            else if (value == "LRshockVel")
+            else if (tempString == "  LeftRear:" && std::find(sessionData.begin(), sessionData.end(), "  LeftRear:\n") != sessionData.end())
             {
-                result.rlShockCol = (s32)row.size();
+                COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
+                flSection = false;
+                frSection = false;
+                rlSection = true;
+                rrSection = false;
             }
-            else if (value == "RRshockVel")
+            else if (tempString == "  RightRear:" && std::find(sessionData.begin(), sessionData.end(), "  RightRear:\n") != sessionData.end())
             {
-                result.rrShockCol = (s32)row.size();
-            }
-            else if (value == "LFpressure")
-            {
-                result.flTyreCol = (s32)row.size();
-            }
-            else if (value == "RFpressure")
-            {
-                result.frTyreCol = (s32)row.size();
-            }
-            else if (value == "LRpressure")
-            {
-                result.rlTyreCol = (s32)row.size();
-            }
-            else if (value == "RRpressure")
-            {
-                result.rrTyreCol = (s32)row.size();
+                COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
+                flSection = false;
+                frSection = false;
+                rlSection = false;
+                rrSection = true;
             }
             
-            row.push_back(value);
-        }
-        
-        result.data.push_back(row);
-        if (fmod((s32)result.data.size() * oneValuePercent, 5.0f) < oneValuePercent)
-        {
-            printf("File Parsed: %.0f%%...\n", (s32)result.data.size() * oneValuePercent);
+            if (flSection)
+            {
+                RegexMatchSetup(&ibtInfo.setupInfo[FL], tempString, consoleHandle);
+            }
+            else if (frSection)
+            {
+                RegexMatchSetup(&ibtInfo.setupInfo[FR], tempString, consoleHandle);
+            }
+            else if (rlSection)
+            {
+                RegexMatchSetup(&ibtInfo.setupInfo[RL], tempString, consoleHandle);
+            }
+            else if (rrSection)
+            {
+                RegexMatchSetup(&ibtInfo.setupInfo[RR], tempString, consoleHandle);
+            }
+            
+            if (currChar == '\n')
+            {
+                sessionData.push_back(tempString);
+                tempString = "";
+            }
         }
     }
-    return result;
+    
+    if (ttrDebug)
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "\n--- Var Header ---");
+    }
+    else
+    {
+        printf("\n");
+    }
+    
+    varHeaders = new irsdk_varHeader[header.numVars];
+    if (varHeaders)
+    {
+        fseek(file, header.varHeaderOffset, SEEK_SET);
+        fread(varHeaders, 1, header.numVars * sizeof(irsdk_varHeader), file);
+        
+        for (s32 i = 0; i < header.numVars; ++i)
+        {
+            irsdk_varHeader *currHeader = &varHeaders[i];
+            
+            if (currHeader)
+            {
+                std::string nameString(currHeader->name);
+                if (nameString == "Lap" ||
+                    nameString == "LFpressure" || nameString == "RFpressure" || nameString == "LRpressure" || nameString == "RRpressure" || nameString == "LFshockVel" || nameString == "RFshockVel" || nameString == "LRshockVel" || nameString == "RRshockVel")
+                {
+                    if (nameString == "Lap")
+                    {
+                        dataSetInfo.lapIndex = i;
+                    }
+                    else if (nameString == "LFpressure")
+                    {
+                        dataSetInfo.tyreIndices[FL] = i;
+                    }
+                    else if (nameString == "RFpressure")
+                    {
+                        dataSetInfo.tyreIndices[FR] = i;
+                    }
+                    else if (nameString == "LRpressure")
+                    {
+                        dataSetInfo.tyreIndices[RL] = i;
+                    }
+                    else if (nameString == "RRpressure")
+                    {
+                        dataSetInfo.tyreIndices[RR] = i;
+                    }
+                    else if (nameString == "LFshockVel")
+                    {
+                        dataSetInfo.shockIndices[FL] = i;
+                    }
+                    else if (nameString == "RFshockVel")
+                    {
+                        dataSetInfo.shockIndices[FR] = i;
+                    }
+                    else if (nameString == "LRshockVel")
+                    {
+                        dataSetInfo.shockIndices[RL] = i;
+                    }
+                    else if (nameString == "RRshockVel")
+                    {
+                        dataSetInfo.shockIndices[RR] = i;
+                    }
+                    
+                    COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, nameString << " Index Set: " << i);
+                }
+            }
+        }
+    }
+    
+    if (ttrDebug)
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "\n--- Data ---");
+    }
+    
+    char *varBuffer = new char[header.bufLen];
+    std::vector<std::string> dataLines;
+    if (varBuffer)
+    {
+        fseek(file, header.varBuf[0].bufOffset, SEEK_SET);
+        
+        COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\nRetrieving Data from IBT...");
+        
+        std::string tempString = "";
+        while (fread(varBuffer, sizeof(char), header.bufLen, file))
+        {
+            // Data Line Processing
+            for (s32 i = 0; i < header.numVars; ++i)
+            {
+                irsdk_varHeader *currHeader = &varHeaders[i];
+                
+                if (currHeader)
+                {
+                    if (i == dataSetInfo.lapIndex)
+                    {
+                        s32 lap = *((s32 *)(varBuffer + currHeader->offset));
+                        ibtInfo.laps.push_back(lap);
+                    }
+                    else if (i == dataSetInfo.tyreIndices[FL])
+                    {
+                        f32 pressure = *((f32 *)(varBuffer + currHeader->offset));
+                        if (pressure > ibtInfo.tyrePressures[FL])
+                        {
+                            ibtInfo.tyrePressures[FL] = pressure;
+                        }
+                    }
+                    else if (i == dataSetInfo.tyreIndices[FR])
+                    {
+                        f32 pressure = *((f32 *)(varBuffer + currHeader->offset));
+                        if (pressure > ibtInfo.tyrePressures[FR])
+                        {
+                            ibtInfo.tyrePressures[FR] = pressure;
+                        }
+                    }
+                    else if (i == dataSetInfo.tyreIndices[RL])
+                    {
+                        f32 pressure = *((f32 *)(varBuffer + currHeader->offset));
+                        if (pressure > ibtInfo.tyrePressures[RL])
+                        {
+                            ibtInfo.tyrePressures[RL] = pressure;
+                        }
+                    }
+                    else if (i == dataSetInfo.tyreIndices[RR])
+                    {
+                        f32 pressure = *((f32 *)(varBuffer + currHeader->offset));
+                        if (pressure > ibtInfo.tyrePressures[RR])
+                        {
+                            ibtInfo.tyrePressures[RR] = pressure;
+                        }
+                    }
+                    else if (i == dataSetInfo.shockIndices[FL])
+                    {
+                        f32 shockVel = *((f32 *)(varBuffer + currHeader->offset));
+                        shockVel *= 39.37f; // Convert from mm/s to in/s
+                        ibtInfo.shockVels[FL].push_back(shockVel);
+                    }
+                    else if (i == dataSetInfo.shockIndices[FR])
+                    {
+                        f32 shockVel = *((f32 *)(varBuffer + currHeader->offset));
+                        shockVel *= 39.37f; // Convert from mm/s to in/s
+                        ibtInfo.shockVels[FR].push_back(shockVel);
+                    }
+                    else if (i == dataSetInfo.shockIndices[RL])
+                    {
+                        f32 shockVel = *((f32 *)(varBuffer + currHeader->offset));
+                        shockVel *= 39.37f; // Convert from mm/s to in/s
+                        ibtInfo.shockVels[RL].push_back(shockVel);
+                    }
+                    else if (i == dataSetInfo.shockIndices[RR])
+                    {
+                        f32 shockVel = *((f32 *)(varBuffer + currHeader->offset));
+                        shockVel *= 39.37f; // Convert from mm/s to in/s
+                        ibtInfo.shockVels[RR].push_back(shockVel);
+                    }
+                }
+            }
+        }
+        
+        COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\nData Retrieved from IBT!");
+    }
+    
+    if (ttrDebug)
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "\n--- Clean Up ---");
+    }
+    
+    // Clean Up
+    if (sessionInfoString)
+    {
+        if (ttrDebug)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, "Session Data Cleansed");
+        }
+        delete[] sessionInfoString;
+        sessionInfoString = 0;
+    }
+    
+    if (varHeaders)
+    {
+        if (ttrDebug)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, "Var Header Cleansed");
+        }
+        delete[] varHeaders;
+        varHeaders = 0;
+    }
+    
+    if (varBuffer)
+    {
+        if (ttrDebug)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, "Telemetry Data Cleansed\n");
+        }
+        delete[] varBuffer;
+        varBuffer = 0;
+    }
+    
+    return ibtInfo;
 }
 
 s32 main (s32 argc, char *argv[])
@@ -194,7 +467,7 @@ s32 main (s32 argc, char *argv[])
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".yhhhhhhhy/     .shhhhhhhs-     ");
     std::cout << "                                                             ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, "/hhhhhhhh+    ");
-    std::cout << "  Setup Assistant v1.0, created by Brock Salmon               ";
+    std::cout << "  Setup Assistant v1.1, created by Brock Salmon               ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".oyhhhhhhs.  ");
     std::cout << "---------------------------------------------------------------------------\n\n";
     
@@ -210,14 +483,14 @@ s32 main (s32 argc, char *argv[])
     std::cout << "*      forbidden, through using this software you agree to these terms.      *" << std::endl;
     COLOUR_TEXT_ENDLINE(consoleHandle, BLUE, "---------------------------------------------------------------------------\n\n");
     
-    // Use argv to get CSV filename
-    char *csvFilename = 0;
+    // Use argv to get IBT filename
+    char *ibtFilename = 0;
     
     b32 ttrDebug = false;
     
     if (argc == 2 || argc == 3) 
     {
-        csvFilename = argv[1];
+        ibtFilename = argv[1];
         if (argc == 3)
         {
             std::string debugStringCheck = argv[2];
@@ -229,109 +502,38 @@ s32 main (s32 argc, char *argv[])
     }
     else if (argc < 2)
     {
-        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Missing CSV Filename");
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Missing IBT Filename");
         return 1;
     }
     else if (argc > 3)
     {
-        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Too many arguments, only CSV filepath is needed");
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Too many arguments, only IBT filepath and optional debug parameter is needed");
         return 1;
     }
     
     // Open file
-    std::ifstream fileIn;
-    fileIn.open(csvFilename);
-    if (!fileIn.is_open())
+    FILE *file = 0;
+    fopen_s(&file, ibtFilename, "rb");
+    if (!file)
     {
-        printf("Failed to open %s\n", csvFilename);
+        printf("Failed to open %s\n", ibtFilename);
         return 1;
     }
     
-    CSVInfo csvInfo = InitArray(fileIn);
-    fileIn.close();
-    
-    
-    if (csvInfo.lapCol == 0 ||
-        csvInfo.flShockCol == 0 || csvInfo.frShockCol == 0 ||
-        csvInfo.rlShockCol == 0 || csvInfo.rrShockCol == 0 ||
-        csvInfo.flTyreCol == 0 || csvInfo.frTyreCol == 0 ||
-        csvInfo.rlTyreCol == 0 || csvInfo.rrTyreCol == 0)
-    {
-        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "\n!!! Not all Data Columns Found !!!\n");
-    }
-    else
-    {
-        COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\nAll Data Columns Found.");
-    }
-    
-    // Cut header and labels out of the array
-    csvInfo.data.erase(csvInfo.data.begin(), csvInfo.data.begin() + 12);
-    
-    ShockInfo shocks[4];
-    shocks[FL].tyrePressure = 0.0f;
-    shocks[FR].tyrePressure = 0.0f;
-    shocks[RL].tyrePressure = 0.0f;
-    shocks[RR].tyrePressure = 0.0f;
-    
-    // Find highest Tyre Pressures
-    printf("\nFinding Max Tyre Pressures...\n");
-    for (s32 i = 0; i < 4; ++i)
-    {
-        for (s32 j = 0; j < csvInfo.data.size(); ++j)
-        {
-            switch (i)
-            {
-                case FL:
-                {
-                    if (std::stof(csvInfo.data[j][csvInfo.flTyreCol]) > shocks[FL].tyrePressure)
-                    {
-                        shocks[FL].tyrePressure = std::stof(csvInfo.data[j][csvInfo.flTyreCol]);
-                    }
-                    break;
-                }
-                case FR:
-                {
-                    if (std::stof(csvInfo.data[j][csvInfo.frTyreCol]) > shocks[FR].tyrePressure)
-                    {
-                        shocks[FR].tyrePressure = std::stof(csvInfo.data[j][csvInfo.frTyreCol]);
-                    }
-                    break;
-                }
-                case RL:
-                {
-                    if (std::stof(csvInfo.data[j][csvInfo.rlTyreCol]) > shocks[RL].tyrePressure)
-                    {
-                        shocks[RL].tyrePressure = std::stof(csvInfo.data[j][csvInfo.rlTyreCol]);
-                    }
-                    break;
-                }
-                case RR:
-                {
-                    if (std::stof(csvInfo.data[j][csvInfo.rrTyreCol]) > shocks[RR].tyrePressure)
-                    {
-                        shocks[RR].tyrePressure = std::stof(csvInfo.data[j][csvInfo.rrTyreCol]);
-                    }
-                    break;
-                }
-                default:
-                {
-                    break;
-                }
-            }
-        }
-    }
+    IBTInfo ibtInfo = ReadIBT(file, consoleHandle, ttrDebug);
+    fclose(file);
     
     // Use laps to filter out valid data
-    s32 currMin = std::stoi(csvInfo.data[0][csvInfo.lapCol]);
+    s32 currMin = ibtInfo.laps[1];
     s32 currMax = INT_MAX;
     s32 minCutoff = 0;
     b32 minCutoffSet = false;
     s32 maxCutoff = INT_MAX;
     b32 maxCutoffSet = false;
     
-    for (s32 i = 0; i < csvInfo.data.size(); ++i)
+    for (s32 i = 1; i < ibtInfo.laps.size(); ++i)
     {
-        s32 currLapVal = std::stoi(csvInfo.data[i][csvInfo.lapCol]);
+        s32 currLapVal = ibtInfo.laps[i];
         if (currLapVal < currMin)
         {
             currMin = currLapVal;
@@ -352,7 +554,7 @@ s32 main (s32 argc, char *argv[])
             if (currLapVal == currMax + 2)
             {
                 maxCutoff = i - 1;
-                currMax = std::stoi(csvInfo.data[maxCutoff][csvInfo.lapCol]);
+                currMax = ibtInfo.laps[maxCutoff];
             }
         }
     }
@@ -368,22 +570,41 @@ s32 main (s32 argc, char *argv[])
         COLOUR_TEXT_ENDLINE(consoleHandle, RED, "--------------");
     }
     
-    printf("\nGetting Shock Data within correct Lap range...\n");
-    std::vector<std::vector<std::string>> newCSVData;
-    f32 oneCutoffPercent = 100.0f / (maxCutoff - minCutoff);
-    for (s32 i = minCutoff; i <= maxCutoff; ++i)
+    if (maxCutoff <= minCutoff)
     {
-        newCSVData.push_back(csvInfo.data[i]);
-        if (fmod((i - minCutoff) * oneCutoffPercent, 5.0f) < oneCutoffPercent)
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "\nData Sample Size too small! (Too Few Laps?)");
+        return 1;
+    }
+    
+    printf("\nValidating Shock Data within correct Lap range...\n");
+    
+    b32 lapsInvalid = true;
+    for (s32 i = 0; i < 4; ++i)
+    {
+        std::vector<s32> validatedLaps; 
+        std::vector<f32> validatedShockData;
+        for (s32 j = minCutoff; j <= maxCutoff; ++j)
         {
-            printf("Data Validated: %.0f%%...\n", (i - minCutoff) * oneCutoffPercent);
+            validatedShockData.push_back(ibtInfo.shockVels[i][j]);
+            
+            if (lapsInvalid)
+            {
+                validatedLaps.push_back(ibtInfo.laps[j]);
+            }
+        }
+        ibtInfo.shockVels[i] = validatedShockData;
+        if (lapsInvalid)
+        {
+            ibtInfo.laps = validatedLaps;
+            lapsInvalid = false;
         }
     }
     
-    csvInfo.data = newCSVData;
+    printf("\nShock Data Validated\n");
     
     printf("\nGetting Shock Data...\n");
     // Get shock values from array
+    OutputInfo outputInfo[4] = {};
     for (s32 i = 0; i < 4; ++i)
     {
         if (i == FL)
@@ -403,88 +624,19 @@ s32 main (s32 argc, char *argv[])
             printf("Getting RR Shock Data...\n");
         }
         
-        shocks[i].loCom = 0.0f;
-        shocks[i].loReb = 0.0f;
-        shocks[i].hiCom = 0.0f;
-        shocks[i].hiReb = 0.0f;
-        
-        for (s32 j = 0; j < csvInfo.data.size(); ++j)
+        for (s32 j = 0; j < ibtInfo.laps.size(); ++j)
         {
-            switch (i)
+            try
             {
-                case FL:
+                f32 fInchValue = ibtInfo.shockVels[i][j];
+                if (fInchValue > -10.0f && fInchValue < 10.0f)
                 {
-                    try
-                    {
-                        f32 fInchValue = std::stof(csvInfo.data[j][csvInfo.flShockCol]) * 39.37f;
-                        if (fInchValue > -10.0f && fInchValue < 10.0f)
-                        {
-                            shocks[FL].shockVelValues.push_back(fInchValue);
-                        }
-                    }
-                    catch (std::invalid_argument e)
-                    {
-                        std::cerr << "Invalid Argument: " << e.what() << std::endl;
-                    }
-                    break;
+                    outputInfo[i].shockVelValues.push_back(fInchValue);
                 }
-                
-                case FR:
-                {
-                    try
-                    {
-                        f32 fInchValue = std::stof(csvInfo.data[j][csvInfo.frShockCol]) * 39.37f;
-                        if (fInchValue > -10.0f && fInchValue < 10.0f)
-                        {
-                            shocks[FR].shockVelValues.push_back(fInchValue);
-                        }
-                    }
-                    catch (std::invalid_argument e)
-                    {
-                        std::cerr << "Invalid Argument: " << e.what() << std::endl;
-                    }
-                    break;
-                }
-                
-                case RL:
-                {
-                    try
-                    {
-                        f32 fInchValue = std::stof(csvInfo.data[j][csvInfo.rlShockCol]) * 39.37f;
-                        if (fInchValue > -10.0f && fInchValue < 10.0f)
-                        {
-                            shocks[RL].shockVelValues.push_back(fInchValue);
-                        }
-                    }
-                    catch (std::invalid_argument e)
-                    {
-                        std::cerr << "Invalid Argument: " << e.what() << std::endl;
-                    }
-                    break;
-                }
-                
-                case RR:
-                {
-                    try
-                    {
-                        f32 fInchValue = std::stof(csvInfo.data[j][csvInfo.rrShockCol]) * 39.37f;
-                        if (fInchValue > -10.0f && fInchValue < 10.0f)
-                        {
-                            shocks[RR].shockVelValues.push_back(fInchValue);
-                        }
-                    }
-                    catch (std::invalid_argument e)
-                    {
-                        std::cerr << "Invalid Argument: " << e.what() << std::endl;
-                    }
-                    break;
-                }
-                
-                default:
-                {
-                    // NOTE(bSalmon): If this ever gets hit then something has gone badly wrong
-                    break;
-                }
+            }
+            catch (std::invalid_argument e)
+            {
+                std::cerr << "Invalid Argument: " << e.what() << std::endl;
             }
         }
     }
@@ -514,87 +666,88 @@ s32 main (s32 argc, char *argv[])
         }
         
         // Get percent of one value of an array
-        f32 oneValuePercent = 100.0f / (f32)shocks[i].shockVelValues.size();
+        f32 oneValuePercent = 100.0f / (f32)outputInfo[i].shockVelValues.size();
         s32 rebCount = 0;
         s32 comCount = 0;
         f32 comTotal = 0.0f;
         f32 rebTotal = 0.0f;
         
-        for (s32 j = 0; j < shocks[i].shockVelValues.size(); ++j)
+        for (s32 j = 0; j < outputInfo[i].shockVelValues.size(); ++j)
         {
-            f32 currVal = shocks[i].shockVelValues[j];
+            f32 currVal = outputInfo[i].shockVelValues[j];
             if (currVal < -hiLoBoundary)
             {
-                shocks[i].hiReb += oneValuePercent;
+                outputInfo[i].hiReb += oneValuePercent;
                 rebTotal += currVal;
                 rebCount++;
             }
             else if (currVal < 0.0f && currVal >= -hiLoBoundary)
             {
-                shocks[i].loReb += oneValuePercent;
+                outputInfo[i].loReb += oneValuePercent;
                 rebTotal += currVal;
                 rebCount++;
             }
             else if (currVal > hiLoBoundary)
             {
-                shocks[i].hiCom += oneValuePercent;
+                outputInfo[i].hiCom += oneValuePercent;
                 comTotal += currVal;
                 comCount++;
             }
             else if (currVal > 0.0f && currVal <= hiLoBoundary)
             {
-                shocks[i].loCom += oneValuePercent;
+                outputInfo[i].loCom += oneValuePercent;
                 comTotal += currVal;
                 comCount++;
             }
         }
         
-        shocks[i].aveCom = comTotal / comCount;
-        shocks[i].aveReb = (rebTotal / rebCount) * -1; // To make it a positive value
+        outputInfo[i].aveCom = comTotal / comCount;
+        outputInfo[i].aveReb = (rebTotal / rebCount) * -1; // To make it a positive value
     }
     
     // TODO(bSalmon): Is the differing %'s a bug or resolution issue?
-    printf("\nFL Reb Ave: %.02f%%", shocks[FL].aveReb);
-    printf("\t\tFR Reb Ave: %.02f%%\n", shocks[FR].aveReb);
-    printf("FL Hi Reb: %.2f%%", shocks[FL].hiReb);
-    printf("\t\tFR Hi Reb: %.2f%%\n", shocks[FR].hiReb);
-    printf("FL Lo Reb: %.2f%%", shocks[FL].loReb);
-    printf("\t\tFR Lo Reb: %.2f%%\n", shocks[FR].loReb);
-    printf("FL Lo Com: %.2f%%", shocks[FL].loCom);
-    printf("\t\tFR Lo Com: %.2f%%\n", shocks[FR].loCom);
-    printf("FL Hi Com: %.2f%%", shocks[FL].hiCom);
-    printf("\t\tFR Hi Com: %.2f%%\n", shocks[FR].hiCom);
-    printf("FL Com Ave: %.02f%%", shocks[FL].aveCom);
-    printf("\t\tFR Com Ave: %.02f%%\n", shocks[FR].aveCom);
-    printf("FL Max Tyre Pres: %0.2fkPa", shocks[FL].tyrePressure);
-    printf("\tFR Max Tyre Pres: %0.2fkPa\n\n", shocks[FR].tyrePressure);
+    printf("\nFL Reb Ave: %.02f%%", outputInfo[FL].aveReb);
+    printf("\t\tFR Reb Ave: %.02f%%\n", outputInfo[FR].aveReb);
+    printf("FL Hi Reb: %.2f%%", outputInfo[FL].hiReb);
+    printf("\t\tFR Hi Reb: %.2f%%\n", outputInfo[FR].hiReb);
+    printf("FL Lo Reb: %.2f%%", outputInfo[FL].loReb);
+    printf("\t\tFR Lo Reb: %.2f%%\n", outputInfo[FR].loReb);
+    printf("FL Lo Com: %.2f%%", outputInfo[FL].loCom);
+    printf("\t\tFR Lo Com: %.2f%%\n", outputInfo[FR].loCom);
+    printf("FL Hi Com: %.2f%%", outputInfo[FL].hiCom);
+    printf("\t\tFR Hi Com: %.2f%%\n", outputInfo[FR].hiCom);
+    printf("FL Com Ave: %.02f%%", outputInfo[FL].aveCom);
+    printf("\t\tFR Com Ave: %.02f%%\n", outputInfo[FR].aveCom);
+    printf("FL Max Tyre Pres: %0.2fkPa", ibtInfo.tyrePressures[FL]);
+    printf("\tFR Max Tyre Pres: %0.2fkPa\n\n", ibtInfo.tyrePressures[FR]);
     
-    printf("RL Reb Ave: %.02f%%", shocks[RL].aveReb);
-    printf("\t\tRR Reb Ave: %.02f%%\n", shocks[RR].aveReb);
-    printf("RL Hi Reb: %.2f%%", shocks[RL].hiReb);
-    printf("\t\tRR Hi Reb: %.2f%%\n", shocks[RR].hiReb);
-    printf("RL Lo Reb: %.2f%%", shocks[RL].loReb);
-    printf("\t\tRR Lo Reb: %.2f%%\n", shocks[RR].loReb);
-    printf("RL Lo Com: %.2f%%", shocks[RL].loCom);
-    printf("\t\tRR Lo Com: %.2f%%\n", shocks[RR].loCom);
-    printf("RL Hi Com: %.2f%%", shocks[RL].hiCom);
-    printf("\t\tRR Hi Com: %.2f%%\n", shocks[RR].hiCom);
-    printf("RL Com Ave: %.02f%%", shocks[RL].aveCom);
-    printf("\t\tRR Com Ave: %.02f%%\n", shocks[RR].aveCom);
-    printf("RL Max Tyre Pres: %0.2fkPa", shocks[RL].tyrePressure);
-    printf("\tRR Max Tyre Pres: %0.2fkPa\n\n", shocks[RR].tyrePressure);
+    printf("RL Reb Ave: %.02f%%", outputInfo[RL].aveReb);
+    printf("\t\tRR Reb Ave: %.02f%%\n", outputInfo[RR].aveReb);
+    printf("RL Hi Reb: %.2f%%", outputInfo[RL].hiReb);
+    printf("\t\tRR Hi Reb: %.2f%%\n", outputInfo[RR].hiReb);
+    printf("RL Lo Reb: %.2f%%", outputInfo[RL].loReb);
+    printf("\t\tRR Lo Reb: %.2f%%\n", outputInfo[RR].loReb);
+    printf("RL Lo Com: %.2f%%", outputInfo[RL].loCom);
+    printf("\t\tRR Lo Com: %.2f%%\n", outputInfo[RR].loCom);
+    printf("RL Hi Com: %.2f%%", outputInfo[RL].hiCom);
+    printf("\t\tRR Hi Com: %.2f%%\n", outputInfo[RR].hiCom);
+    printf("RL Com Ave: %.02f%%", outputInfo[RL].aveCom);
+    printf("\t\tRR Com Ave: %.02f%%\n", outputInfo[RR].aveCom);
+    printf("RL Max Tyre Pres: %0.2fkPa", ibtInfo.tyrePressures[RL]);
+    printf("\tRR Max Tyre Pres: %0.2fkPa\n\n", ibtInfo.tyrePressures[RR]);
     
     // Get difference between %'s for adjustment
     for (s32 i = 0; i < 4; ++i)
     {
-        shocks[i].loDiff = shocks[i].loReb - shocks[i].loCom;
-        shocks[i].hiDiff = shocks[i].hiReb - shocks[i].hiCom;
+        outputInfo[i].loDiff = outputInfo[i].loReb - outputInfo[i].loCom;
+        outputInfo[i].hiDiff = outputInfo[i].hiReb - outputInfo[i].hiCom;
         
-        shocks[i].loAdjust = roundf(shocks[i].loDiff);
-        shocks[i].hiAdjust = roundf(shocks[i].hiDiff);
+        outputInfo[i].loAdjust = (s32)roundf(outputInfo[i].loDiff);
+        outputInfo[i].hiAdjust = (s32)roundf(outputInfo[i].hiDiff);
         
-        shocks[i].tyrePresDiff = shocks[i].tyrePressure - 180.0f;
+        outputInfo[i].tyrePresDiff = ibtInfo.tyrePressures[i] - 180.0f;
         
+        // Shock Changes
         // Suggest adjustments based on %'s
         switch (i)
         {
@@ -624,83 +777,172 @@ s32 main (s32 argc, char *argv[])
             }
         }
         
-        if (shocks[i].loDiff < 0.0f)
+        SetupInfo adjustedSet[4] = {ibtInfo.setupInfo[0], ibtInfo.setupInfo[1], ibtInfo.setupInfo[2], ibtInfo.setupInfo[3]};
+        
+        if (outputInfo[i].loDiff < 0.0f)
         {
             // Increase Rebound
-            if (shocks[i].loAdjust <= -1.0f)
+            if (outputInfo[i].loAdjust <= -1.0f)
             {
-                COLOUR_TEXT(consoleHandle, AQUA, "\tIncrease ");
-                printf("LS Reb: ");
-                COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, (shocks[i].loAdjust * -1) << " Clicks");
+                if (adjustedSet[i].lsReb + (outputInfo[i].loAdjust * -1) <= 16)
+                {
+                    adjustedSet[i].lsReb += (outputInfo[i].loAdjust * -1);
+                }
+                else if (adjustedSet[i].lsReb + (outputInfo[i].loAdjust * -1) > 16)
+                {
+                    s32 overflow = (adjustedSet[i].lsReb + (outputInfo[i].loAdjust * -1)) - 16;
+                    adjustedSet[i].lsReb = 16;
+                    
+                    if (adjustedSet[i].lsCom - overflow >= 0)
+                    {
+                        adjustedSet[i].lsCom -= overflow;
+                    }
+                    else
+                    {
+                        adjustedSet[i].lsCom = 0;
+                    }
+                }
             }
         }
-        else if (shocks[i].loDiff > 0.0f)
+        else if (outputInfo[i].loDiff > 0.0f)
         {
             // Increase Compression
-            if (shocks[i].loAdjust >= 1.0f)
+            if (outputInfo[i].loAdjust >= 1.0f)
             {
-                COLOUR_TEXT(consoleHandle, AQUA, "\tIncrease ");
-                printf("LS Comp: ");
-                COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, shocks[i].loAdjust << " Clicks");
+                if (adjustedSet[i].lsCom + outputInfo[i].loAdjust <= 16)
+                {
+                    adjustedSet[i].lsCom += outputInfo[i].loAdjust;
+                }
+                else if (adjustedSet[i].lsCom + outputInfo[i].loAdjust > 16)
+                {
+                    s32 overflow = (adjustedSet[i].lsCom + outputInfo[i].loAdjust) - 16;
+                    adjustedSet[i].lsCom = 16;
+                    
+                    if (adjustedSet[i].lsReb - overflow >= 0)
+                    {
+                        adjustedSet[i].lsReb -= overflow;
+                    }
+                    else
+                    {
+                        adjustedSet[i].lsReb = 0;
+                    }
+                }
             }
-        }
-        else
-        {
-            // Perfect (Unlikely)
-            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\tLow Speed Correct");
         }
         
-        if (shocks[i].hiDiff < 0.0f)
+        if (outputInfo[i].hiDiff < 0.0f)
         {
             // Decrease Compression
-            if (shocks[i].hiAdjust <= -1.0f)
+            if (outputInfo[i].hiAdjust <= -1.0f)
             {
-                COLOUR_TEXT(consoleHandle, PURPLE, "\tDecrease ");
-                printf("HS Comp: ");
-                COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, (shocks[i].hiAdjust * -1) << " Clicks");
+                if (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1) >= 0)
+                {
+                    adjustedSet[i].hsCom -= (outputInfo[i].hiAdjust * -1);
+                }
+                else if (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1) < 0)
+                {
+                    s32 overflow = (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1)) * 1;
+                    adjustedSet[i].hsCom = 0;
+                    
+                    if (adjustedSet[i].hsReb + overflow <= 12)
+                    {
+                        adjustedSet[i].hsReb += overflow;
+                    }
+                    else
+                    {
+                        adjustedSet[i].hsReb = 12;
+                    }
+                }
             }
         }
-        else if (shocks[i].hiDiff > 0.0f)
+        else if (outputInfo[i].hiDiff > 0.0f)
         {
             // Decrease Rebound
-            if (shocks[i].hiAdjust >= 1.0f)
+            if (outputInfo[i].hiAdjust >= 1.0f)
             {
-                COLOUR_TEXT(consoleHandle, PURPLE, "\tDecrease ");
-                printf("HS Reb: ");
-                COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, shocks[i].hiAdjust << " Clicks");
+                if (adjustedSet[i].hsReb - outputInfo[i].hiAdjust >= 0)
+                {
+                    adjustedSet[i].hsReb -= outputInfo[i].hiAdjust;
+                }
+                else if (adjustedSet[i].hsReb - outputInfo[i].hiAdjust < 0)
+                {
+                    s32 overflow = (adjustedSet[i].hsReb - outputInfo[i].hiAdjust) * 1;
+                    adjustedSet[i].hsReb = 0;
+                    
+                    if (adjustedSet[i].hsCom + overflow <= 12)
+                    {
+                        adjustedSet[i].hsCom += overflow;
+                    }
+                    else
+                    {
+                        adjustedSet[i].hsCom = 12;
+                    }
+                }
             }
+        }
+        
+        printf("\tLow Speed Comp: ");
+        if (adjustedSet[i].lsCom != ibtInfo.setupInfo[i].lsCom)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, adjustedSet[i].lsCom << " clicks");
         }
         else
         {
-            // Perfect (Unlikely)
-            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\tHigh Speed Correct");
+            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, adjustedSet[i].lsCom << " clicks");
+        }
+        printf("\tHigh Speed Comp: ");
+        if (adjustedSet[i].hsCom != ibtInfo.setupInfo[i].hsCom)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, adjustedSet[i].hsCom << " clicks");
+        }
+        else
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, adjustedSet[i].hsCom << " clicks");
+        }
+        printf("\tLow Speed Reb: ");
+        if (adjustedSet[i].lsReb != ibtInfo.setupInfo[i].lsReb)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, adjustedSet[i].lsReb << " clicks");
+        }
+        else
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, adjustedSet[i].lsReb << " clicks");
+        }
+        printf("\tHigh Speed Reb: ");
+        if (adjustedSet[i].hsReb != ibtInfo.setupInfo[i].hsReb)
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, adjustedSet[i].hsReb << " clicks");
+        }
+        else
+        {
+            COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, adjustedSet[i].hsReb << " clicks");
         }
         
         // Use Tyre difference to suggest adjustments
-        if (shocks[i].tyrePresDiff < 2.0f && shocks[i].tyrePresDiff > -2.0f)
+        if (outputInfo[i].tyrePresDiff < 2.0f && outputInfo[i].tyrePresDiff > -2.0f)
         {
             COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "\tTyre Pressure Within Optimal Base Range");
         }
         else
         {
-            if (shocks[i].tyrePresDiff > 2.0f)
+            if (outputInfo[i].tyrePresDiff > 2.0f)
             {
                 // Over 182.0kPa
                 printf("\tTyre Pressure: ");
                 SET_TEXT_YELLOW(consoleHandle);
-                printf("%0.2fkPa", shocks[i].tyrePresDiff);
+                printf("%0.2fkPa", outputInfo[i].tyrePresDiff);
                 SET_TEXT_WHITE(consoleHandle);
                 COLOUR_TEXT(consoleHandle, PURPLE, " over ");
                 printf("optimal baseline of ");
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "180kPa");
             }
-            else if (shocks[i].tyrePresDiff < -2.0f)
+            else if (outputInfo[i].tyrePresDiff < -2.0f)
             {
-                shocks[i].tyrePresDiff *= -1;
+                outputInfo[i].tyrePresDiff *= -1;
                 // Under 178.0kPa
                 printf("\tTyre Pressure: ");
                 SET_TEXT_YELLOW(consoleHandle);
-                printf("%0.2fkPa", shocks[i].tyrePresDiff);
+                printf("%0.2fkPa", outputInfo[i].tyrePresDiff);
                 SET_TEXT_WHITE(consoleHandle);
                 COLOUR_TEXT(consoleHandle, AQUA, " under ");
                 printf("optimal baseline of ");
@@ -708,9 +950,6 @@ s32 main (s32 argc, char *argv[])
             }
         }
     }
-    
-    COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, "\n\tNOTE: If you are unable to complete the changes, \n\tan inverse adjustment on the other damper will make up for this");
-    COLOUR_TEXT_ENDLINE(consoleHandle, YELLOW, "\n\teg: Increasing a LS Rebound by 2 clicks is equivalent to \n\tDecreasing the LS Compression by 2 clicks\n");
     
     return 0;
 }
