@@ -5,8 +5,26 @@ Author: Brock Salmon
 Notice: (C) Copyright 2019 by Brock Salmon and Trans Tasman Racing. All Rights Reserved.
 */
 
-// After IBT
+// TODO v1.2
+// TODO(bSalmon): Show Comparison with Best Time on closest weather
+//   TODO(bSalmon): Register Weather, Lap Time, Driver, and Car
+//   TODO(bSalmon): Upload File to the TTR FTP
+//   TODO(bSalmon): Download .ttrsa files and show closest weather's best lap
+// NOTE(bSalmon): .ttrsa file structure (20 bytes)
+// NOTE(bSalmon): Driver: TTR_Drivers enum (4 bytes)
+// NOTE(bSalmon): Car: TTR_Cars enum (4 bytes)
+// NOTE(bSalmon): Time: f32 (4 bytes)
+// NOTE(bSalmon): Weather: WeatherInfo struct (8 bytes)
+//   NOTE(bSalmon): Ambient Temp: u8 (1 byte)
+//   NOTE(bSalmon): Track Temp: u8 (1 byte)
+//   NOTE(bSalmon): Wind Dir: u8 (1 byte)
+//   NOTE(bSalmon): Wind Speed: u8 (1 byte)
+//   NOTE(bSalmon): Time of Day: f32 (4 bytes)
+// TODO(bSalmon): General efficiency updates
+
+// TODO Long-Term
 // TODO(bSalmon): Change how telemetry is parsed based on car
+// TODO(bSalmon): Maybe make a Windows Application?
 
 // Static Definitions
 #define internal_func static
@@ -31,18 +49,14 @@ typedef float f32;
 typedef double f64;
 
 #include <stdio.h>
+#include <iostream>
 #include <vector>
 #include <string>
 #include <sstream>
-#include <cmath>
-#include <iostream>
 #include <Windows.h>
-#include <stdexcept>
 #include <regex>
-#include <algorithm>
 
 #include "irsdk_defines.h"
-#include "irsdk_utils.cpp"
 
 #define FL 0
 #define FR 1
@@ -444,6 +458,14 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
 
 s32 main (s32 argc, char *argv[])
 {
+    LARGE_INTEGER perfCounterFreqResult;
+    QueryPerformanceFrequency(&perfCounterFreqResult);
+    s64 perfCounterFreq = perfCounterFreqResult.QuadPart;
+    
+    LARGE_INTEGER beginTimer;
+    QueryPerformanceCounter(&beginTimer);
+    u64 beginCycleCount = __rdtsc();
+    
     HANDLE consoleHandle;
     consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
     SET_TEXT_WHITE(consoleHandle);
@@ -467,7 +489,7 @@ s32 main (s32 argc, char *argv[])
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".yhhhhhhhy/     .shhhhhhhs-     ");
     std::cout << "                                                             ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, "/hhhhhhhh+    ");
-    std::cout << "  Setup Assistant v1.1, created by Brock Salmon               ";
+    std::cout << "  Setup Assistant v1.2, created by Brock Salmon               ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".oyhhhhhhs.  ");
     std::cout << "---------------------------------------------------------------------------\n\n";
     
@@ -536,8 +558,15 @@ s32 main (s32 argc, char *argv[])
         s32 currLapVal = ibtInfo.laps[i];
         if (currLapVal < currMin)
         {
-            currMin = currLapVal;
-            minCutoffSet = false;
+            if (ibtInfo.laps[i + 1] != currLapVal)
+            {
+                // Do nothing as it's probably a telemetry glitch
+            }
+            else
+            {
+                currMin = currLapVal;
+                minCutoffSet = false;
+            }
         }
         
         if (currLapVal == (currMin + 1) && !minCutoffSet)
@@ -841,7 +870,7 @@ s32 main (s32 argc, char *argv[])
                 }
                 else if (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1) < 0)
                 {
-                    s32 overflow = (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1)) * 1;
+                    s32 overflow = (adjustedSet[i].hsCom - (outputInfo[i].hiAdjust * -1)) * -1;
                     adjustedSet[i].hsCom = 0;
                     
                     if (adjustedSet[i].hsReb + overflow <= 12)
@@ -866,7 +895,7 @@ s32 main (s32 argc, char *argv[])
                 }
                 else if (adjustedSet[i].hsReb - outputInfo[i].hiAdjust < 0)
                 {
-                    s32 overflow = (adjustedSet[i].hsReb - outputInfo[i].hiAdjust) * 1;
+                    s32 overflow = (adjustedSet[i].hsReb - outputInfo[i].hiAdjust) * -1;
                     adjustedSet[i].hsReb = 0;
                     
                     if (adjustedSet[i].hsCom + overflow <= 12)
@@ -947,9 +976,19 @@ s32 main (s32 argc, char *argv[])
                 COLOUR_TEXT(consoleHandle, AQUA, " under ");
                 printf("optimal baseline of ");
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "180kPa");
+                printf("\n");
             }
         }
     }
+    
+    u64 endCycleCount = __rdtsc();
+    u64 cyclesElapsed = endCycleCount - beginCycleCount;
+    LARGE_INTEGER endTimer;
+    QueryPerformanceCounter(&endTimer);
+    f32 timeElapsed = ((f32)(endTimer.QuadPart - beginTimer.QuadPart) / (f32)perfCounterFreq);
+    
+    COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "Executed in " << timeElapsed << " seconds");
+    COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "Executed in " << cyclesElapsed << " cycles");
     
     return 0;
 }
