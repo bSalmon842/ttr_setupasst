@@ -55,8 +55,10 @@ typedef double f64;
 #include <sstream>
 #include <Windows.h>
 #include <regex>
+#include <strsafe.h>
 
 #include "irsdk_defines.h"
+#include "ttr_verify.h"
 
 #define FL 0
 #define FR 1
@@ -125,35 +127,62 @@ struct OutputInfo
 internal_func void RegexMatchSetup(SetupInfo *setupInfo, std::string line, HANDLE consoleHandle)
 {
     std::regex damperRegex("^   (.s)(Comp|Rbd)(Damping: )([0-9]|1[0-6])( clicks)");
-    std::regex lsComRegex("^   (LsCompDamping: )([0-9]|1[0-6])( clicks)");
-    std::regex hsComRegex("^   (HsCompDamping: )([0-9]|1[0-6])( clicks)");
-    std::regex lsRebRegex("^   (LsRbdDamping: )([0-9]|1[0-6])( clicks)");
-    std::regex hsRebRegex("^   (HsRbdDamping: )([0-9]|1[0-6])( clicks)");
     
     if (std::regex_match(line, damperRegex))
     {
         std::stringstream stream;
         std::string word;
         stream << line;
+        s32 index = -1;
         while (!stream.eof())
         {
+            s32 checker = 0;
             stream >> word;
             
-            if (std::regex_match(line, lsComRegex))
+            if (word == "LsCompDamping:")
             {
-                std::stringstream(word) >> setupInfo->lsCom;
+                index = 0;
             }
-            else if (std::regex_match(line, hsComRegex))
+            else if (word == "HsCompDamping:")
             {
-                std::stringstream(word) >> setupInfo->hsCom;
+                index = 1;
             }
-            else if (std::regex_match(line, lsRebRegex))
+            else if (word == "LsRbdDamping:")
             {
-                std::stringstream(word) >> setupInfo->lsReb;
+                index = 2;
             }
-            else if (std::regex_match(line, hsRebRegex))
+            else if (word == "HsRbdDamping:")
             {
-                std::stringstream(word) >> setupInfo->hsReb;
+                index = 3;
+            }
+            
+            if (index == 0)
+            {
+                if (std::stringstream(word) >> checker)
+                {
+                    setupInfo->lsCom = checker;
+                }
+            }
+            else if (index == 1)
+            {
+                if (std::stringstream(word) >> checker)
+                {
+                    setupInfo->hsCom = checker;
+                }
+            }
+            else if (index == 2)
+            {
+                if (std::stringstream(word) >> checker)
+                {
+                    setupInfo->lsReb = checker;
+                }
+            }
+            else if (index == 3)
+            {
+                if (std::stringstream(word) >> checker)
+                {
+                    setupInfo->hsReb = checker;
+                }
             }
         }
         
@@ -179,7 +208,6 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
     }
     
     char *sessionInfoString = new char[header.sessionInfoLen];
-    std::vector<std::string> sessionData;
     if (sessionInfoString)
     {
         fseek(file, header.sessionInfoOffset, SEEK_SET);
@@ -200,7 +228,7 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
             char currChar = sessionInfoString[i];
             tempString += currChar;
             
-            if (tempString == "  LeftFront:" && std::find(sessionData.begin(), sessionData.end(), "  LeftFront:\n") != sessionData.end())
+            if (tempString == "  LeftFront:")
             {
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
                 flSection = true;
@@ -208,7 +236,7 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
                 rlSection = false;
                 rrSection = false;
             }
-            else if (tempString == "  RightFront:" && std::find(sessionData.begin(), sessionData.end(), "  RightFront:\n") != sessionData.end())
+            else if (tempString == "  RightFront:")
             {
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
                 flSection = false;
@@ -216,7 +244,7 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
                 rlSection = false;
                 rrSection = false;
             }
-            else if (tempString == "  LeftRear:" && std::find(sessionData.begin(), sessionData.end(), "  LeftRear:\n") != sessionData.end())
+            else if (tempString == "  LeftRear:")
             {
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
                 flSection = false;
@@ -224,7 +252,7 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
                 rlSection = true;
                 rrSection = false;
             }
-            else if (tempString == "  RightRear:" && std::find(sessionData.begin(), sessionData.end(), "  RightRear:\n") != sessionData.end())
+            else if (tempString == "  RightRear:")
             {
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, tempString);
                 flSection = false;
@@ -252,7 +280,6 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
             
             if (currChar == '\n')
             {
-                sessionData.push_back(tempString);
                 tempString = "";
             }
         }
@@ -458,6 +485,95 @@ internal_func IBTInfo ReadIBT(FILE *file, HANDLE consoleHandle, b32 ttrDebug)
 
 s32 main (s32 argc, char *argv[])
 {
+    HANDLE consoleHandle;
+    consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+    
+    f32 version = 1.25f;
+    
+    if (!TTR_Verify(argv[argc - 1]))
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "User could not be verified.\n\n");
+        return 1;
+    }
+    else
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "User Verified: " << argv[argc - 1]);
+    }
+    
+    if (strcmp(argv[argc - 2], "update") == 0)
+    {
+        printf("Checking for Updates...\n");
+        s32 updateCode = TTR_Update(&version);
+        if (updateCode == 0)
+        {
+            // Up-To-Date
+            COLOUR_TEXT_ENDLINE(consoleHandle, BLUE, "Software is already Up-To-Date\n");
+            return 0;
+        }
+        else if (updateCode == 1)
+        {
+            // Updated
+            SET_TEXT_GREEN(consoleHandle);
+            printf("Successfully Updated to Version %.2f\n", version);
+            printf("Restart Program now to use the updated version\n");
+            SET_TEXT_WHITE(consoleHandle);
+            
+            STARTUPINFO si = {};
+            PROCESS_INFORMATION pi = {};
+            
+            char exePath[MAX_PATH];
+            char *exeName = 0;
+            
+            GetModuleFileNameA(0, exePath, MAX_PATH);
+            
+            for (char *scan = exePath; *scan; ++scan)
+            {
+                if (*scan == '\\')
+                {
+                    exeName = scan + 1;
+                    
+                }
+            }
+            
+            s32 pathIndex = 0;
+            while (exePath[pathIndex] != '\0')
+            {
+                pathIndex++;
+            }
+            
+            s32 exeIndex = 0;
+            while (exeName[exeIndex] != '\0')
+            {
+                exeIndex++;
+            }
+            
+            exePath[pathIndex - exeIndex] = '\0';
+            
+            char moduleName[MAX_PATH];
+            ConcatenateStrings(StringLength(exePath), exePath,
+                               StringLength("old.exe"), "old.exe",
+                               moduleName);
+            
+            char cmd[MAX_PATH];
+            StringCbPrintf(cmd, MAX_PATH, 
+                           TEXT("cmd.exe /C ping 1.1.1.1 -n 1 -w 3000 > Nul & Del /f /q \"%s\""),
+                           moduleName);
+            
+            CreateProcess(0, cmd, 0, 0, FALSE, CREATE_NO_WINDOW, 0, 0, &si, &pi);
+            
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            
+            return 0;
+        }
+        else if (updateCode == 2)
+        {
+            // Failed to Update
+            COLOUR_TEXT_ENDLINE(consoleHandle, RED, "Update Failed\n");
+            return 1;
+        }
+    }
+    
     LARGE_INTEGER perfCounterFreqResult;
     QueryPerformanceFrequency(&perfCounterFreqResult);
     s64 perfCounterFreq = perfCounterFreqResult.QuadPart;
@@ -466,8 +582,6 @@ s32 main (s32 argc, char *argv[])
     QueryPerformanceCounter(&beginTimer);
     u64 beginCycleCount = __rdtsc();
     
-    HANDLE consoleHandle;
-    consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
     SET_TEXT_WHITE(consoleHandle);
     std::cout << std::endl;
     std::cout << "---------------------------------------------------------------------------" << std::endl;
@@ -489,7 +603,9 @@ s32 main (s32 argc, char *argv[])
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".yhhhhhhhy/     .shhhhhhhs-     ");
     std::cout << "                                                             ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, "/hhhhhhhh+    ");
-    std::cout << "  Setup Assistant v1.2, created by Brock Salmon               ";
+    std::cout << "  Setup Assistant v";
+    printf("%.02f", version);
+    std::cout << ", created by Brock Salmon              ";
     COLOUR_TEXT_ENDLINE(consoleHandle, RED, ".oyhhhhhhs.  ");
     std::cout << "---------------------------------------------------------------------------\n\n";
     
@@ -510,27 +626,11 @@ s32 main (s32 argc, char *argv[])
     
     b32 ttrDebug = false;
     
-    if (argc == 2 || argc == 3) 
+    ibtFilename = argv[1];
+    std::string debugStringCheck = argv[2];
+    if (debugStringCheck == "-d")
     {
-        ibtFilename = argv[1];
-        if (argc == 3)
-        {
-            std::string debugStringCheck = argv[2];
-            if (debugStringCheck == "-d")
-            {
-                ttrDebug = true;
-            }
-        }
-    }
-    else if (argc < 2)
-    {
-        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Missing IBT Filename");
-        return 1;
-    }
-    else if (argc > 3)
-    {
-        COLOUR_TEXT_ENDLINE(consoleHandle, RED, "FAILED: Too many arguments, only IBT filepath and optional debug parameter is needed");
-        return 1;
+        ttrDebug = true;
     }
     
     // Open file
@@ -976,7 +1076,6 @@ s32 main (s32 argc, char *argv[])
                 COLOUR_TEXT(consoleHandle, AQUA, " under ");
                 printf("optimal baseline of ");
                 COLOUR_TEXT_ENDLINE(consoleHandle, GREEN, "180kPa");
-                printf("\n");
             }
         }
     }
@@ -987,8 +1086,11 @@ s32 main (s32 argc, char *argv[])
     QueryPerformanceCounter(&endTimer);
     f32 timeElapsed = ((f32)(endTimer.QuadPart - beginTimer.QuadPart) / (f32)perfCounterFreq);
     
-    COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "Executed in " << timeElapsed << " seconds");
-    COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "Executed in " << cyclesElapsed << " cycles");
+    if (ttrDebug)
+    {
+        COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "\nExecuted in " << timeElapsed << " seconds");
+        COLOUR_TEXT_ENDLINE(consoleHandle, PURPLE, "Executed in " << cyclesElapsed << " cycles");
+    }
     
     return 0;
 }
